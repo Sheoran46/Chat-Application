@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Siddharth Chat — App</title>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.5.1/sockjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+
+    <style>
+        /* compact styles similar to your design, plus user list */
+        * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { display:flex; height:100vh; align-items:center; justify-content:center; margin:0; background: #0f172a; color:#fff; }
+        .container { width:900px; display:flex; gap:20px; }
+        .chat-card { background: rgba(255,255,255,0.04); padding:18px; border-radius:12px; width:620px; display:flex; flex-direction:column; }
+        .panel { background: rgba(255,255,255,0.03); padding:12px; border-radius:12px; width:240px; height:520px; overflow:auto; }
+        .header { font-size:20px; margin-bottom:10px; }
+        #messages { flex:1; overflow:auto; display:flex; flex-direction:column; gap:8px; padding-right:8px; }
+        .msg { padding:10px 12px; border-radius:10px; max-width:75%; box-shadow:0 6px 12px rgba(0,0,0,0.3); }
+        .me { align-self:flex-end; background: linear-gradient(135deg,#4c83ff,#2afadf); color:#fff; }
+        .other { align-self:flex-start; background: linear-gradient(135deg,#ff0080,#ffcc00); color:#111; }
+        .meta { font-size:12px; opacity:0.8; margin-bottom:6px; }
+        .controls { display:flex; gap:8px; margin-top:10px; }
+        input[type="text"] { flex:1; padding:10px; border-radius:8px; border:none; }
+        button { padding:10px 14px; border-radius:8px; border:none; cursor:pointer; background:#7c3aed; color:white; }
+        .user { padding:8px; border-radius:8px; cursor:pointer; margin-bottom:6px; background:rgba(255,255,255,0.02); }
+        .user:hover { background: rgba(255,255,255,0.04); }
+        .typing { font-size:12px; opacity:0.9; height:18px; margin-top:6px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="chat-card">
+        <div class="header">🔥 Siddharth Live Chat — Upgraded</div>
+
+        <div>
+            <input id="sender" type="text" placeholder="Your name" style="width:200px; margin-bottom:10px;">
+            <button id="joinBtn">Join</button>
+            <span id="status" style="margin-left:10px; font-size:13px; opacity:0.9"></span>
+        </div>
+
+        <div id="messages" style="margin-top:12px;"></div>
+
+        <div class="typing" id="typing"></div>
+
+        <div class="controls">
+            <input id="message" type="text" placeholder="Type a message..." disabled oninput="onTyping()">
+            <button id="sendBtn" onclick="send()" disabled>Send</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div style="font-weight:bold; margin-bottom:8px;">Online Users</div>
+        <div id="users"></div>
+
+        <div style="height:12px"></div>
+        <div style="font-weight:bold; margin-top:8px; margin-bottom:8px;">Actions</div>
+        <button onclick="loadHistory()">Load recent messages</button>
+        <div style="margin-top:8px; color:#aaa; font-size:13px;">Tip: click a username to start a private message.</div>
+    </div>
+</div>
+
+<script>
+    let stompClient = null;
+    let myName = "";
+    let typingTimeout = null;
+
+    function connectSocket() {
+      const socket = new SockJS("/ws-chat");
+      stompClient = Stomp.over(socket);
+      stompClient.connect({}, function(frame) {
+        console.log('Connected: ' + frame);
+        stompClient.subscribe("/topic/messages", function(msg) {
+          show(JSON.parse(msg.body));
+        });
+        stompClient.subscribe("/topic/users", function(msg) {
+          showUsers(JSON.parse(msg.body));
+        });
+        stompClient.subscribe("/topic/typing", function(msg) {
+          const m = JSON.parse(msg.body);
+          showTyping(m);
+        });
+        // private messages for this user
+        stompClient.subscribe("/user/queue/messages", function(msg) {
+          show(JSON.parse(msg.body), true);
+        });
+      }, function(err) {
+        console.error('STOMP error', err);
+      });
+    }
+
+    function join() {
+      const senderInput = document.getElementById('sender');
+      const name = senderInput.value && senderInput.value.trim();
+      if (!name) return alert('Enter a name');
+      myName = name;
+      document.getElementById('status').innerText = 'Connected as ' + myName;
+      document.getElementById('message').disabled = false;
+      document.getElementById('sendBtn').disabled = false;
+      document.getElementById('joinBtn').disabled = true;
+      // send join notification
+      stompClient.send("/app/join", {}, JSON.stringify({ type: 'JOIN', sender: myName, content: myName + ' joined' }));
+    }
+
+    function send() {
+      const textEl = document.getElementById('message');
+      const text = textEl.value && textEl.value.trim();
+      if (!text) return;
+      // if message starts with /pm username:message -> private
+      if (text.startsWith('/pm ')) {
+        const rest = text.substring(4);
+        const idx = rest.indexOf(':');
+        if (idx>0) {
+          const to = rest.substring(0, idx).trim();
+          const msg = rest.substring(idx+1).trim();
+          stompClient.send("/app/sendMessage", {}, JSON.stringify({ type: 'PRIVATE', sender: myName, content: msg, toUser: to }));
+          appendLocalPrivate(myName, to, msg);
+          textEl.value = '';
+          return;
+        }
+      }
+      stompClient.send("/app/sendMessage", {}, JSON.stringify({ type: 'CHAT', sender: myName, content: text }));
+      textEl.value = '';
+    }
+
+    function show(msg, isPrivate = false) {
+      const messages = document.getElementById('messages');
+      const bubble = document.createElement('div');
+      const isMe = msg.sender === myName;
+      bubble.className = 'msg ' + (isMe ? 'me' : 'other');
+
+      const time = new Date(msg.timestamp || Date.now());
+      const meta = `<div class="meta"><b>${msg.sender}</b> ${isPrivate ? '<i>(private)</i>' : ''} • ${time.toLocaleTimeString()}</div>`;
+
+      if (msg.type === 'JOIN' || msg.type === 'LEAVE') {
+        bubble.style.background = 'rgba(255,255,255,0.06)';
+        bubble.style.color = '#ddd';
+        bubble.innerHTML = `<i>${msg.content}</i>`;
+      } else {
+        bubble.innerHTML = meta + `<div>${escapeHtml(msg.content)}</div>`;
+      }
+
+      messages.appendChild(bubble);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function appendLocalPrivate(from, to, content) {
+      const messages = document.getElementById('messages');
+      const bubble = document.createElement('div');
+      bubble.className = 'msg me';
+      bubble.innerHTML = `<div class="meta"><b>To ${to}</b> • ${new Date().toLocaleTimeString()}</div><div>${escapeHtml(content)}</div>`;
+      messages.appendChild(bubble);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function showUsers(list) {
+      const container = document.getElementById('users');
+      container.innerHTML = '';
+      if (!list) return;
+      // list could be array or set
+      const arr = Array.isArray(list) ? list : Object.values(list);
+      arr.forEach(u => {
+        const el = document.createElement('div');
+        el.className = 'user';
+        el.innerText = u;
+        el.onclick = () => {
+          const messageEl = document.getElementById('message');
+          messageEl.value = `/pm ${u}:`;
+          messageEl.focus();
+        };
+        container.appendChild(el);
+      });
+    }
+
+    function onTyping() {
+      if (!myName) return;
+      stompClient.send("/app/typing", {}, JSON.stringify({ type: 'TYPING', sender: myName }));
+      // clear typing after 1.2s of inactivity
+      if (typingTimeout) clearTimeout(typingTimeout);
+      typingTimeout = setTimeout(() => {
+        // send empty typing to indicate stop? We'll just not show typing after timeout on client side
+        document.getElementById('typing').innerText = '';
+      }, 1200);
+    }
+
+    function showTyping(msg) {
+      const t = document.getElementById('typing');
+      if (msg.sender !== myName) {
+        t.innerText = msg.sender + ' is typing...';
+        setTimeout(() => { t.innerText = ''; }, 1200);
+      }
+    }
+
+    function loadHistory() {
+      fetch('/messages/recent?n=50')
+        .then(r => r.json())
+        .then(list => {
+          const messages = document.getElementById('messages');
+          messages.innerHTML = '';
+          list.forEach(m => show(m));
+        });
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.replace(/[&<>"'`=\/]/g, function(s) {
+        return ({
+          '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','/':'&#x2F;','`':'&#x60;','=':'&#x3D;'
+        })[s];
+      });
+    }
+
+    // initialize socket on page load
+    connectSocket();
+
+    // wire join button
+    document.getElementById('joinBtn').addEventListener('click', join);
+
+    // optional: load existing users on load
+    fetch('/users').then(r => r.json()).then(u => showUsers(u));
+</script>
+</body>
+</html>
